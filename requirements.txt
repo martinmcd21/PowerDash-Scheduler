@@ -1,0 +1,22 @@
+streamlit==1.40.1
+python-dotenv==1.0.1
+
+# OpenAI new SDK (for responses.create & vision)
+openai>=1.57.0
+
+# Email + IMAP
+imaplib2>=3.6
+beautifulsoup4==4.12.3
+
+# PDF + image parsing
+pillow==11.0.0
+pypdf2==3.0.1
+
+# ICS calendar invite generation
+ics==0.7.2
+
+# Required for new OpenAI SDK
+pydantic>=2.7.4
+
+# Optional but useful
+requests==2.31.0
