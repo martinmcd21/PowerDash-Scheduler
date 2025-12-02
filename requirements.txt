@@ -1,11 +1,22 @@
 streamlit==1.40.1
+python-dotenv==1.0.1
 
-# OpenAI Python SDK (new 1.x line – chat.completions still supported)
+# OpenAI new SDK (required for responses.create)
 openai>=1.57.0
 
-# IMAP & email parsing helpers
-beautifulsoup4==4.12.3
+# Email + IMAP Parsing
+imaplib2>=3.6
+beautifulsoup4>=4.12.3
 
-# Optional, but useful in many Streamlit apps
-python-dotenv==1.0.1
-requests==2.31.0
+# PDF → Image conversion
+pymupdf==1.24.10
+
+#ICS calendar invites
+ics==0.7.2
+
+# Required for new OpenAI SDK
+pydantic>=2.7.4
+
+# Optional helpers
+requests>=2.31.0
+pillow>=10.0.0
