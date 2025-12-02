@@ -13,6 +13,12 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 from openai import OpenAI
 
+# PDF & Image Conversion
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+import base64
+
 # =========================
 #  CONFIG & CLIENT SETUP
 # =========================
@@ -129,91 +135,75 @@ def send_email_with_ics(
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, recipients, msg.as_string())
 
+# --------------------------------------------------------
+# PDF → PNG Conversion Helper (Required for GPT Vision API)
+# --------------------------------------------------------
+def pdf_to_png(file_bytes: bytes) -> bytes:
+    """Convert first page of a PDF into a PNG image (as bytes)."""
+    pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    page = pdf.load_page(0)
+    pix = page.get_pixmap(dpi=200)
+    png_bytes = pix.tobytes("png")
+    return png_bytes
 
+# --------------------------------------------------------
+# Calendar Parsing (PDFs + Images → OCR → Slots)
+# --------------------------------------------------------
 def parse_calendar(file_bytes: bytes, filename: str):
-    """
-    Use GPT-4o-mini (vision) to extract free slots from a calendar screenshot/PDF.
+    # If PDF → convert to PNG
+    if filename.lower().endswith(".pdf"):
+        try:
+            file_bytes = pdf_to_png(file_bytes)
+            mime = "image/png"
+        except Exception as e:
+            st.error(f"PDF conversion failed: {e}")
+            return []
+    else:
+        # Assume image already
+        mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
 
-    Expected JSON shape:
-    {
-      "slots": [
-        {"date": "2025-11-28", "start": "09:00", "end": "09:30"},
-        ...
-      ]
-    }
-    """
-    mime = "application/pdf" if filename.lower().endswith(".pdf") else "image/png"
+    # Convert to base64
     b64 = base64.b64encode(file_bytes).decode("utf-8")
-    data_uri = f"data:{mime};base64,{b64}"
 
     prompt = """
-You see a calendar screenshot or PDF showing a week or two of availability.
-
-Extract a list of all **available** time slots that are clearly free, suitable for interviews.
-
-Rules:
-- Only include blocks that look free/available (do not include "busy", "OOO", etc).
-- Represent each slot as:
-  { "date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM" }
-- Use 24h time.
-- If there is a long free window, split into sensible interview blocks (30–120 minutes).
-- Ignore minutes if not visible; assume :00.
-
-Return a single JSON object with key "slots", e.g.:
-
+Extract all AVAILABLE free time slots from this weekly calendar image.
+Return ONLY valid JSON like:
 {
   "slots": [
-    {"date": "2025-11-28", "start": "09:00", "end": "10:00"},
-    {"date": "2025-11-29", "start": "14:00", "end": "15:30"}
+    {"date": "2025-11-30", "start": "09:00", "end": "09:30"},
+    {"date": "2025-11-30", "start": "10:00", "end": "11:00"}
   ]
 }
-
-Return ONLY valid JSON. No commentary.
-    """.strip()
+Only JSON. No commentary.
+"""
 
     try:
-        resp = client.chat.completions.create(
+        resp = client.responses.create(
             model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You extract clean JSON time slots from calendar images for interview scheduling.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                },
+            input=[
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image": {"data": b64, "mime_type": mime}}
             ],
+            max_output_tokens=500
         )
+        raw = resp.output_text
+
     except Exception as e:
         st.error(f"Error calling OpenAI for calendar parsing: {e}")
         return []
 
-    raw = resp.choices[0].message.content.strip()
-
-    # Try to isolate JSON
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1:
-        raw_json = raw[start : end + 1]
-    else:
-        raw_json = raw
-
+    # Decode JSON
     try:
-        data = json.loads(raw_json)
-        slots = data.get("slots", [])
-        if not isinstance(slots, list):
-            raise ValueError("JSON 'slots' is not a list.")
-        return slots
+        obj = json.loads(raw)
+        if "slots" in obj:
+            return obj["slots"]
+        else:
+            st.error("Model returned JSON, but missing 'slots' key.")
+            return []
     except Exception as e:
-        st.error(f"Could not parse JSON from model: {e}")
-        st.code(raw, language="json")
+        st.error(f"Could not parse model JSON: {e}")
+        st.code(raw)
         return []
-
 
 def generate_scheduling_email(
     cand_name: str,
