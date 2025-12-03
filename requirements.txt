@@ -1,22 +1,14 @@
 streamlit==1.40.1
 python-dotenv==1.0.1
 
-# OpenAI new SDK (required for responses.create)
-openai>=1.57.0
+openai>=1.52.0
 
-# Email + IMAP Parsing
-imaplib2>=3.6
-beautifulsoup4>=4.12.3
+# PDF + image processing
+pymupdf==1.23.10
+Pillow==10.2.0
 
-# PDF → Image conversion
-pymupdf==1.24.10
+# IMAP + email parsing
+beautifulsoup4==4.12.3
 
-#ICS calendar invites
-ics==0.7.2
-
-# Required for new OpenAI SDK
-pydantic>=2.7.4
-
-# Optional helpers
-requests>=2.31.0
-pillow>=10.0.0
+# For ICS creation via text (no extra package needed, but safe)
+icalendar==5.0.7
