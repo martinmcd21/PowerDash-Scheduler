@@ -2,13 +2,11 @@ streamlit==1.40.1
 python-dotenv==1.0.1
 openai>=1.52.0
 
-# Image processing
+# PDF → PNG conversion
+pdf2image==1.16.3
 Pillow==11.0.0
 
-# PDF → PNG
-pdf2image==1.16.3
-
-# Email parsing
+# IMAP & email parsing helpers
 beautifulsoup4==4.12.3
 
 # Timezones
