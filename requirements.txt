@@ -1,14 +1,15 @@
 streamlit==1.40.1
 python-dotenv==1.0.1
-
 openai>=1.52.0
 
-# PDF + image processing
-pymupdf==1.23.10
-Pillow==10.2.0
+# Image processing
+Pillow==11.0.0
 
-# IMAP + email parsing
+# PDF → PNG
+pdf2image==1.16.3
+
+# Email parsing
 beautifulsoup4==4.12.3
 
-# For ICS creation via text (no extra package needed, but safe)
-icalendar==5.0.7
+# Timezones
+pytz==2024.1
