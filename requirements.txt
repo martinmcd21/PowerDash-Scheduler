@@ -1,13 +1,16 @@
 streamlit==1.40.1
+
+# OpenAI (new Responses API)
+openai>=1.51.0
+
+# Environment handling
 python-dotenv==1.0.1
-openai>=1.52.0
 
-# PDF → PNG conversion
-pdf2image==1.16.3
-Pillow==11.0.0
+# PDF → PNG conversion (PyMuPDF)
+PyMuPDF==1.24.3
 
-# IMAP & email parsing helpers
-beautifulsoup4==4.12.3
+# Image processing
+Pillow==10.3.0
 
-# Timezones
-pytz==2024.1
+# General HTTP library (used by Streamlit & OpenAI internally)
+requests==2.31.0
