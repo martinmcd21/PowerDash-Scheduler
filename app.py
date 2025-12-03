@@ -17,7 +17,6 @@ from openai import OpenAI
 import fitz  # PyMuPDF
 from PIL import Image
 import io
-import base64
 
 # =========================
 #  CONFIG & CLIENT SETUP
@@ -135,8 +134,9 @@ def send_email_with_ics(
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, recipients, msg.as_string())
 
+
 # --------------------------------------------------------
-# PDF → PNG Conversion Helper (Required for GPT Vision API)
+# PDF → PNG Conversion Helper (Required for GPT Vision)
 # --------------------------------------------------------
 def pdf_to_png(file_bytes: bytes) -> bytes:
     """Convert first page of a PDF into a PNG image (as bytes)."""
@@ -146,10 +146,16 @@ def pdf_to_png(file_bytes: bytes) -> bytes:
     png_bytes = pix.tobytes("png")
     return png_bytes
 
+
 # --------------------------------------------------------
 # Calendar Parsing (PDFs + Images → OCR → Slots)
 # --------------------------------------------------------
 def parse_calendar(file_bytes: bytes, filename: str):
+    """
+    Convert PDF to PNG if needed, then call GPT-4o-mini via chat.completions
+    with an image_url and text prompt. Returns a list of slot dicts.
+    """
+
     # If PDF → convert to PNG
     if filename.lower().endswith(".pdf"):
         try:
@@ -160,10 +166,14 @@ def parse_calendar(file_bytes: bytes, filename: str):
             return []
     else:
         # Assume image already
-        mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+        if filename.lower().endswith(".png"):
+            mime = "image/png"
+        else:
+            mime = "image/jpeg"
 
-    # Convert to base64
+    # Convert to data URL for image_url
     b64 = base64.b64encode(file_bytes).decode("utf-8")
+    data_url = f"data:{mime};base64,{b64}"
 
     prompt = """
 Extract all AVAILABLE free time slots from this weekly calendar image.
@@ -175,19 +185,30 @@ Return ONLY valid JSON like:
   ]
 }
 Only JSON. No commentary.
-"""
+""".strip()
 
     try:
-        resp = client.responses.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            input=[
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image": {"data": b64, "mime_type": mime}}
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract free time slots from calendar images and respond ONLY with valid JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                },
             ],
-            max_output_tokens=500
         )
-        raw = resp.output_text
-
+        raw = resp.choices[0].message.content.strip()
     except Exception as e:
         st.error(f"Error calling OpenAI for calendar parsing: {e}")
         return []
@@ -195,15 +216,17 @@ Only JSON. No commentary.
     # Decode JSON
     try:
         obj = json.loads(raw)
-        if "slots" in obj:
+        if "slots" in obj and isinstance(obj["slots"], list):
             return obj["slots"]
         else:
             st.error("Model returned JSON, but missing 'slots' key.")
+            st.code(raw)
             return []
     except Exception as e:
         st.error(f"Could not parse model JSON: {e}")
         st.code(raw)
         return []
+
 
 def generate_scheduling_email(
     cand_name: str,
@@ -220,9 +243,7 @@ def generate_scheduling_email(
 
     slot_lines = []
     for i, s in enumerate(slots, start=1):
-        slot_lines.append(
-            f"{i}. {s['date']} {s['start']}–{s['end']} ({cand_tz})"
-        )
+        slot_lines.append(f"{i}. {s['date']} {s['start']}–{s['end']} ({cand_tz})")
     slot_text = "\n".join(slot_lines)
 
     prompt = f"""
