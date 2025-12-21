@@ -1,16 +1,20 @@
+# Streamlit
 streamlit==1.40.1
 
-# OpenAI (new Responses API)
-openai>=1.51.0
+# OpenAI SDK (stable with Streamlit Cloud)
+openai==1.30.1
 
-# Environment handling
+# Environment variables
 python-dotenv==1.0.1
 
-# PDF → PNG conversion (PyMuPDF)
-PyMuPDF==1.24.3
+# Microsoft Graph + Azure Auth
+msal==1.26.0
+msgraph-core==1.0.0
+azure-identity==1.16.0
 
-# Image processing
-Pillow==10.3.0
-
-# General HTTP library (used by Streamlit & OpenAI internally)
+# HTTP
 requests==2.31.0
+
+# PDF handling (ICS / attachments support)
+PyMuPDF==1.24.3
+Pillow==10.3.0
