@@ -1,32 +1,30 @@
-import os
 import base64
+import email
+import imaplib
 import json
+import os
 import re
 import uuid
-import imaplib
-import email
+from datetime import date, datetime, time, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import streamlit as st
 from openai import OpenAI
 
-# PDF → Image
 import fitz  # PyMuPDF
+from audit_log import AuditLogger, redact_payload
+from graph_client import GraphClient, GraphClientError
+from ics_utils import build_ics_invite
 
-
-# =========================
-#  CONFIG & CLIENT SETUP
-# =========================
 
 st.set_page_config(
-    page_title="PowerDash Scheduler — Prototype",
+    page_title="PowerDash Interview Scheduler",
     layout="wide",
 )
 
-# Make page wider / nicer
 st.markdown(
     """
     <style>
@@ -40,47 +38,89 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load secrets (Streamlit Cloud) or env
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+
+# =========================
+#  CONFIG HELPERS
+# =========================
+
+def get_secret(key: str, default: str = "") -> str:
+    return st.secrets.get(key, st.secrets.get(key.lower(), os.environ.get(key, default)))
+
+
+def build_timezone_options() -> List[str]:
+    common = [
+        "UTC",
+        "Europe/London",
+        "Europe/Paris",
+        "Europe/Berlin",
+        "Europe/Dublin",
+        "America/New_York",
+        "America/Chicago",
+        "America/Denver",
+        "America/Los_Angeles",
+        "America/Toronto",
+        "Asia/Singapore",
+        "Asia/Hong_Kong",
+        "Asia/Tokyo",
+        "Australia/Sydney",
+    ]
+    return common
+
+
+# Secrets / env config
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY", get_secret("openai_api_key", ""))
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-SMTP_USER = st.secrets.get("SMTP_USER", os.environ.get("SMTP_USER", ""))
-SMTP_PASSWORD = st.secrets.get("SMTP_PASSWORD", os.environ.get("SMTP_PASSWORD", ""))
-SMTP_HOST = st.secrets.get("SMTP_HOST", os.environ.get("SMTP_HOST", "smtp.gmail.com"))
-SMTP_PORT = int(st.secrets.get("SMTP_PORT", os.environ.get("SMTP_PORT", 587)))
+GRAPH_TENANT_ID = get_secret("graph_tenant_id")
+GRAPH_CLIENT_ID = get_secret("graph_client_id")
+GRAPH_CLIENT_SECRET = get_secret("graph_client_secret")
+GRAPH_SCHEDULER = get_secret("graph_scheduler_mailbox", "scheduling@powerdashhr.com")
 
-IMAP_HOST = st.secrets.get("IMAP_HOST", os.environ.get("IMAP_HOST", "imap.gmail.com"))
-IMAP_PORT = int(st.secrets.get("IMAP_PORT", os.environ.get("IMAP_PORT", 993)))
+SMTP_USER = get_secret("smtp_username", get_secret("SMTP_USER", ""))
+SMTP_PASSWORD = get_secret("smtp_password", get_secret("SMTP_PASSWORD", ""))
+SMTP_HOST = get_secret("smtp_host", get_secret("SMTP_HOST", "smtp.gmail.com"))
+SMTP_PORT = int(get_secret("smtp_port", str(get_secret("SMTP_PORT", "587"))))
+SMTP_FROM = get_secret("smtp_from", SMTP_USER)
+
+IMAP_HOST = get_secret("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(get_secret("IMAP_PORT", "993"))
+
+DEFAULT_TZ = get_secret("default_timezone", "UTC")
+AUDIT_PATH = get_secret("audit_log_path", "audit_log.db")
 
 if not OPENAI_API_KEY:
     st.warning("OPENAI_API_KEY is not set in Streamlit secrets or environment.")
 
 client = OpenAI()
+audit_logger = AuditLogger(AUDIT_PATH)
+graph_client = GraphClient(
+    tenant_id=GRAPH_TENANT_ID,
+    client_id=GRAPH_CLIENT_ID,
+    client_secret=GRAPH_CLIENT_SECRET,
+    scheduler_mailbox=GRAPH_SCHEDULER,
+)
 
-# Initialise session state
-if "slots" not in st.session_state:
-    st.session_state["slots"] = []
-if "email_body" not in st.session_state:
-    st.session_state["email_body"] = ""
-if "parsed_replies" not in st.session_state:
-    st.session_state["parsed_replies"] = []
+# Session state
+st.session_state.setdefault("slots", [])
+st.session_state.setdefault("email_body", "")
+st.session_state.setdefault("parsed_replies", [])
+st.session_state.setdefault("latest_event_id", None)
+st.session_state.setdefault("latest_ics", None)
 
 
 # =========================
 #  EMAIL HELPERS
 # =========================
 
-def send_plain_email(to_email: str, subject: str, body: str, cc: list | None = None):
-    """Send a simple plain-text email via SMTP."""
+def send_plain_email(to_email: str, subject: str, body: str, cc: Optional[list[str]] = None) -> None:
     import smtplib
 
     if not SMTP_USER or not SMTP_PASSWORD:
-        st.error("SMTP_USER / SMTP_PASSWORD not set in secrets.")
-        return
+        raise RuntimeError("SMTP credentials are not configured.")
 
     msg = MIMEMultipart()
-    msg["From"] = SMTP_USER
+    msg["From"] = SMTP_FROM or SMTP_USER
     msg["To"] = to_email
     if cc:
         msg["Cc"] = ", ".join(cc)
@@ -92,7 +132,7 @@ def send_plain_email(to_email: str, subject: str, body: str, cc: list | None = N
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, recipients, msg.as_string())
+        server.sendmail(msg["From"], recipients, msg.as_string())
 
 
 def send_email_with_ics(
@@ -100,38 +140,31 @@ def send_email_with_ics(
     subject: str,
     body: str,
     ics_text: str,
-    cc_emails: list[str] | None = None,
-):
-    """Send email with ICS calendar invite attached to all recipients."""
+    cc_emails: Optional[list[str]] = None,
+) -> None:
     import smtplib
 
     if not SMTP_USER or not SMTP_PASSWORD:
-        st.error("SMTP_USER / SMTP_PASSWORD not set in secrets.")
-        return
+        raise RuntimeError("SMTP credentials are not configured.")
 
     msg = MIMEMultipart("mixed")
-    msg["From"] = SMTP_USER
+    msg["From"] = SMTP_FROM or SMTP_USER
     msg["To"] = ", ".join(to_emails)
     if cc_emails:
         msg["Cc"] = ", ".join(cc_emails)
     msg["Subject"] = subject
 
-    # Plain-text body
     msg.attach(MIMEText(body, "plain"))
 
-    # ICS part
     ics_part = MIMEText(ics_text, "calendar;method=REQUEST")
-    ics_part.add_header(
-        "Content-Disposition", "attachment", filename="interview_invite.ics"
-    )
+    ics_part.add_header("Content-Disposition", "attachment", filename="interview_invite.ics")
     msg.attach(ics_part)
 
     recipients = to_emails + (cc_emails or [])
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, recipients, msg.as_string())
+        server.sendmail(msg["From"], recipients, msg.as_string())
 
 
 # =========================
@@ -139,17 +172,13 @@ def send_email_with_ics(
 # =========================
 
 def pdf_to_png(file_bytes: bytes) -> bytes:
-    """
-    Convert the FIRST page of a PDF into a PNG image (bytes) using PyMuPDF.
-    No poppler / external binaries required.
-    """
     try:
         pdf = fitz.open(stream=file_bytes, filetype="pdf")
         page = pdf.load_page(0)
         pix = page.get_pixmap(dpi=200)
         png_bytes = pix.tobytes("png")
         return png_bytes
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - visualization helper
         raise RuntimeError(f"PDF conversion failed: {e}")
 
 
@@ -158,15 +187,6 @@ def pdf_to_png(file_bytes: bytes) -> bytes:
 # =========================
 
 def parse_calendar(file_bytes: bytes, filename: str):
-    """
-    Take a PDF/PNG/JPG calendar export and return a list of free slots:
-    [
-      {"date": "2025-11-30", "start": "09:00", "end": "09:30"},
-      ...
-    ]
-    """
-
-    # Convert PDFs to PNG, otherwise use the image as-is
     if filename.lower().endswith(".pdf"):
         try:
             file_bytes = pdf_to_png(file_bytes)
@@ -175,12 +195,8 @@ def parse_calendar(file_bytes: bytes, filename: str):
             st.error(str(e))
             return []
     else:
-        if filename.lower().endswith(".png"):
-            mime = "image/png"
-        else:
-            mime = "image/jpeg"
+        mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
 
-    # Base64-encode as data URL for image_url
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
@@ -215,28 +231,23 @@ Rules:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url},
-                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }
             ],
         )
         raw = resp.choices[0].message.content.strip()
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - API path
         st.error(f"Error calling OpenAI for calendar parsing: {e}")
         return []
 
-    # Decode JSON
     try:
         obj = json.loads(raw)
         if "slots" in obj and isinstance(obj["slots"], list):
             return obj["slots"]
-        else:
-            st.error("Model returned JSON, but missing valid 'slots' list.")
-            st.code(raw)
-            return []
+        st.error("Model returned JSON, but missing valid 'slots' list.")
+        st.code(raw)
+        return []
     except Exception as e:
         st.error(f"Could not parse model JSON: {e}")
         st.code(raw)
@@ -256,7 +267,6 @@ def generate_scheduling_email(
     cand_tz: str,
     slots: list[dict],
 ):
-    """Use GPT to generate the scheduling email text (body only – no subject)."""
     if not slots:
         return "No slots available."
 
@@ -309,10 +319,9 @@ Instructions:
 # =========================
 
 def check_scheduler_inbox(limit: int = 10):
-    """Fetch unread messages from the scheduler mailbox via IMAP."""
     results = []
     if not SMTP_USER or not SMTP_PASSWORD:
-        st.error("SMTP_USER / SMTP_PASSWORD not set – cannot check inbox.")
+        st.error("SMTP credentials not set – cannot check inbox.")
         return results
 
     try:
@@ -358,18 +367,13 @@ def check_scheduler_inbox(limit: int = 10):
             )
 
         mail.logout()
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - external IMAP
         st.error(f"Error checking IMAP inbox: {e}")
 
     return results
 
 
 def interpret_slot_choice(body: str, num_slots: int) -> int | None:
-    """
-    Very simple parser:
-    - Look for integers in the email body.
-    - First integer in range [1, num_slots] is treated as the chosen option.
-    """
     numbers = re.findall(r"\b([1-9][0-9]?)\b", body)
     for n in numbers:
         val = int(n)
@@ -379,94 +383,118 @@ def interpret_slot_choice(body: str, num_slots: int) -> int | None:
 
 
 # =========================
-#  ICS INVITE BUILDER
+#  TIME & GRAPH HELPERS
 # =========================
 
-def build_ics_event(
-    slot: dict,
-    hm_name: str,
-    hm_email: str,
-    hm_tz: str,
-    recruiter_name: str,
-    recruiter_email: str,
-    candidate_name: str,
-    candidate_email: str,
-    company: str,
-    role: str,
-    interview_type: str,
-    location_or_instructions: str,
+def normalize_datetime(
+    meeting_date: date,
+    meeting_time: time,
+    tz_name: str,
+    duration_minutes: int,
 ):
-    """
-    Build an ICS text for the chosen slot.
+    tz = ZoneInfo(tz_name)
+    start_local = datetime.combine(meeting_date, meeting_time).replace(tzinfo=tz)
+    end_local = start_local + timedelta(minutes=duration_minutes)
+    return start_local, end_local, start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
-    - Interview type: "Teams" or "Face to face"
-    - Recruiter is optional attendee.
-    """
 
-    tz = ZoneInfo(hm_tz)
-
-    start_dt = datetime.fromisoformat(f"{slot['date']}T{slot['start']}:00").replace(
-        tzinfo=tz
-    )
-    end_dt = datetime.fromisoformat(f"{slot['date']}T{slot['end']}:00").replace(
-        tzinfo=tz
-    )
-
-    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    dtstart_local = start_dt.strftime("%Y%m%dT%H%M%S")
-    dtend_local = end_dt.strftime("%Y%m%dT%H%M%S")
-    uid = f"{uuid.uuid4()}@powerdashhr.com"
-
-    if interview_type == "Teams":
-        summary = f"Teams Interview – {role} at {company}"
-        location = "Microsoft Teams"
-        desc = (
-            f"Online interview via Microsoft Teams.\\n\\n"
-            f"Joining details:\\n{location_or_instructions.strip()}\\n\\n"
-            f"Candidate: {candidate_name}\\nHiring Manager: {hm_name}\\nRecruiter: {recruiter_name}"
+def build_graph_event_payload(
+    subject: str,
+    body: str,
+    start_local: datetime,
+    end_local: datetime,
+    tz_name: str,
+    candidate_email: str,
+    hiring_manager_email: str,
+    recruiter_email: Optional[str],
+    include_recruiter: bool,
+    interview_type: str,
+    location_text: str,
+    organizer_name: str,
+    candidate_name: str,
+    hiring_manager_name: str,
+) -> Dict[str, Any]:
+    attendees = [
+        {
+            "emailAddress": {"address": candidate_email, "name": candidate_name or candidate_email},
+            "type": "required",
+        },
+        {
+            "emailAddress": {"address": hiring_manager_email, "name": hiring_manager_name or hiring_manager_email},
+            "type": "required",
+        },
+    ]
+    if include_recruiter and recruiter_email:
+        attendees.append(
+            {
+                "emailAddress": {"address": recruiter_email, "name": organizer_name or recruiter_email},
+                "type": "optional",
+            }
         )
+
+    payload: Dict[str, Any] = {
+        "subject": subject,
+        "body": {"contentType": "HTML", "content": body.replace("\n", "<br>")},
+        "start": {"dateTime": start_local.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end_local.isoformat(), "timeZone": tz_name},
+        "attendees": attendees,
+        "location": {"displayName": location_text},
+    }
+
+    if interview_type.lower().startswith("teams"):
+        payload["isOnlineMeeting"] = True
+        payload["onlineMeetingProvider"] = "teamsForBusiness"
     else:
-        summary = f"Interview – {role} at {company}"
-        location = "On-site"
-        desc = (
-            f"Face-to-face interview.\\n\\n"
-            f"Location / instructions:\\n{location_or_instructions.strip()}\\n\\n"
-            f"Candidate: {candidate_name}\\nHiring Manager: {hm_name}\\nRecruiter: {recruiter_name}"
-        )
+        payload["isOnlineMeeting"] = False
 
-    ics = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//PowerDashHR//Scheduler//EN
-METHOD:REQUEST
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{dtstamp}
-DTSTART;TZID={hm_tz}:{dtstart_local}
-DTEND;TZID={hm_tz}:{dtend_local}
-SUMMARY:{summary}
-LOCATION:{location}
-DESCRIPTION:{desc}
-ORGANIZER;CN={recruiter_name}:MAILTO:{recruiter_email}
-ATTENDEE;CN={candidate_name};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:MAILTO:{candidate_email}
-ATTENDEE;CN={hm_name};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:MAILTO:{hm_email}
-ATTENDEE;CN={recruiter_name};ROLE=OPT-PARTICIPANT;PARTSTAT=NEEDS-ACTION:MAILTO:{recruiter_email}
-END:VEVENT
-END:VCALENDAR
-""".strip()
+    return payload
 
-    return ics
+
+def build_ics_payload(
+    start_dt_utc: datetime,
+    end_dt_utc: datetime,
+    subject: str,
+    description: str,
+    organizer_name: str,
+    organizer_email: str,
+    attendees: List[tuple[str, str]],
+    location: str,
+    uid: Optional[str] = None,
+) -> str:
+    ics_text = build_ics_invite(
+        start_dt=start_dt_utc,
+        end_dt=end_dt_utc,
+        subject=subject,
+        description=description,
+        organizer_email=organizer_email,
+        organizer_name=organizer_name,
+        attendees=attendees,
+        location=location,
+        uid=uid,
+    )
+    candidate_email = attendees[0][1] if attendees else None
+    audit_logger.log(
+        action="ics_generated",
+        status="success",
+        actor=organizer_email,
+        candidate_email=candidate_email,
+        event_id=uid,
+        payload={"subject": subject},
+    )
+    return ics_text
 
 
 # =========================
 #  UI LAYOUT
 # =========================
 
-st.title("PowerDash Scheduler — Prototype")
-st.caption("Standalone scheduling assistant for in-house TA teams.")
+st.title("PowerDash Interview Scheduler")
+st.caption("Production-ready scheduling with PDF parsing, Microsoft Graph, and ICS fallback.")
 
 tab_main, tab_inbox, tab_invites = st.tabs(
-    ["1️⃣ New scheduling request", "2️⃣ Scheduler inbox", "3️⃣ Calendar invites"]
+    ["New Scheduling Request", "Scheduler Inbox", "Calendar Invites"]
 )
+
 
 # -------------
 # TAB 1: MAIN
@@ -474,7 +502,6 @@ tab_main, tab_inbox, tab_invites = st.tabs(
 with tab_main:
     col_left, col_mid, col_right = st.columns([1.3, 1.0, 1.3])
 
-    # --- Hiring manager & recruiter info ---
     with col_left:
         st.subheader("Hiring Manager & Recruiter")
 
@@ -490,11 +517,8 @@ with tab_main:
 
         st.markdown("---")
         recruiter_name = st.text_input("Recruiter name", value="Amanda Hansen")
-        recruiter_email = st.text_input(
-            "Recruiter email", value="info@powerdashhr.com"
-        )
+        recruiter_email = st.text_input("Recruiter email", value="info@powerdashhr.com")
 
-    # --- Upload calendar ---
     with col_mid:
         st.subheader("Upload Calendar (PDF/Image)")
         uploaded = st.file_uploader(
@@ -519,14 +543,11 @@ with tab_main:
             st.markdown("**Detected free slots**")
             st.dataframe(slots, use_container_width=True, hide_index=True)
 
-    # --- Candidate info & email generation ---
     with col_right:
         st.subheader("Candidate")
 
         cand_name = st.text_input("Candidate name", value="Ruth Nicholson")
-        cand_email = st.text_input(
-            "Candidate email", value="ruthnicholson1@hotmail.com"
-        )
+        cand_email = st.text_input("Candidate email", value="ruthnicholson1@hotmail.com")
         cand_tz = st.text_input(
             "Candidate timezone (IANA, e.g. Europe/London, America/New_York)",
             value="Europe/London",
@@ -632,128 +653,306 @@ with tab_inbox:
 
 
 # -------------
-# TAB 3: INVITES
+# TAB 3: INVITES & GRAPH
 # -------------
 with tab_invites:
-    st.subheader("Create & send calendar invites")
+    st.subheader("Create & manage interview invites (Microsoft Graph)")
 
-    slots = st.session_state.get("slots", [])
-    parsed_replies = st.session_state.get("parsed_replies", [])
+    graph_ready = graph_client.configured
+    graph_status = "✅ Configured" if graph_ready else "⚠️ Configure graph_tenant_id, graph_client_id, graph_client_secret, graph_scheduler_mailbox in secrets."
+    st.info(graph_status)
+    tz_options = build_timezone_options()
+    tz_default_index = tz_options.index(DEFAULT_TZ) if DEFAULT_TZ in tz_options else 0
 
-    if not slots:
-        st.info("No availability slots detected yet. Parse a calendar in tab 1 first.")
-    else:
-        # Choose which reply to use (if any)
-        reply_labels = [
-            f"{i+1}. {r['subject']} — {r['from']}"
-            for i, r in enumerate(parsed_replies)
-        ]
-        selected_reply_index = None
-        if reply_labels:
-            selected_label = st.selectbox(
-                "Candidate reply to use (optional)",
-                options=["(None – choose slot manually)"] + reply_labels,
-                index=0,
-            )
-            if selected_label != "(None – choose slot manually)":
-                selected_reply_index = reply_labels.index(selected_label)
+    with st.expander("Graph diagnostics", expanded=False):
+        st.write("Run quick checks against Microsoft Graph.")
+        if st.button("Run diagnostics"):
+            if not graph_ready:
+                st.warning("Graph credentials are not configured.")
+            else:
+                with st.spinner("Running diagnostics..."):
+                    results = graph_client.diagnostics()
+                st.json(results)
 
-        default_slot_index = 0
-        if (
-            selected_reply_index is not None
-            and parsed_replies[selected_reply_index]["chosen_option"]
-        ):
-            opt = parsed_replies[selected_reply_index]["chosen_option"]
-            if 1 <= opt <= len(slots):
-                default_slot_index = opt - 1
+    st.markdown("### New scheduling request (Graph)")
+    with st.form("graph_create_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            candidate_email = st.text_input("Candidate email", value=st.session_state.get("candidate_email", ""))
+            candidate_name = st.text_input("Candidate name", value="Candidate")
+            include_recruiter = st.checkbox("Include recruiter as attendee", value=True)
+        with col2:
+            hiring_manager_email = st.text_input("Hiring manager email", value=hm_email)
+            hiring_manager_name = st.text_input("Hiring manager name", value=hm_name)
+            recruiter_email_field = st.text_input("Recruiter email", value=recruiter_email)
+        with col3:
+            meeting_date = st.date_input("Interview date", value=date.today())
+            meeting_time = st.time_input("Start time", value=time(hour=10, minute=0))
+            duration_minutes = st.number_input("Duration (minutes)", min_value=15, max_value=240, value=60, step=15)
 
-        slot_options = [
-            f"{i+1}. {s['date']} {s['start']}–{s['end']}"
-            for i, s in enumerate(slots)
-        ]
-        chosen_slot_label = st.selectbox(
-            "Interview slot",
-            options=slot_options,
-            index=default_slot_index,
+        tz_choice = st.selectbox("Display timezone", options=tz_options, index=tz_default_index)
+        subject = st.text_input("Invite subject", value=f"Interview – {role_title}")
+        interview_type = st.radio("Interview type", options=["Teams", "On-site / phone"], horizontal=True)
+
+        location_text = st.text_input(
+            "Location or meeting info",
+            value="Microsoft Teams" if interview_type == "Teams" else "Provide office location or dial-in",
         )
-        chosen_slot_index = slot_options.index(chosen_slot_label)
-        chosen_slot = slots[chosen_slot_index]
-
-        st.markdown("### Interview type")
-
-        interview_type = st.radio(
-            "How will the interview take place?",
-            options=["Teams", "Face to face"],
-            index=0,
-            horizontal=True,
-        )
-
-        if interview_type == "Teams":
-            teams_link = st.text_input(
-                "Teams meeting link / instructions",
-                value="Paste your Teams meeting link here.",
-            )
-            location_text = teams_link or "Microsoft Teams (link to follow)"
-        else:
-            location_text = st.text_area(
-                "Location & instructions (free text)",
-                value="PowerDash HR Offices, 123 Example Street, London.\nPlease report to reception.",
-            )
-
-        st.markdown("### Invite details")
-
-        invite_subject = st.text_input(
-            "Calendar invite subject",
-            value=f"Interview – {role_title} at {company}",
-        )
-
-        default_invite_body = (
-            f"Hi all,\n\n"
-            f"Interview for {role_title} at {company}.\n\n"
-            f"Candidate: {cand_name}\n"
-            f"Hiring manager: {hm_name}\n"
-            f"Recruiter: {recruiter_name}\n\n"
-            f"Best regards,\n{recruiter_name}"
-        )
-
         invite_body = st.text_area(
-            "Email body (sent with the calendar invite)",
-            value=default_invite_body,
-            height=220,
+            "Invitation message",
+            value=(
+                f"Hi all,<br><br>Interview for {role_title} at {company}.<br>"
+                f"Candidate: {cand_name or 'Candidate'}<br>"
+                f"Hiring manager: {hm_name or 'Hiring manager'}<br>"
+                f"Recruiter: {recruiter_name or 'Recruiter'}<br><br>Best regards,<br>{recruiter_name or 'Recruiter'}"
+            ),
+            height=180,
         )
 
-        if st.button(
-            "Generate & send calendar invites",
-            type="primary",
-            disabled=not (SMTP_USER and hm_email and cand_email and recruiter_email),
-        ):
+        submitted = st.form_submit_button("Create interview invite via Graph", disabled=not graph_ready)
+
+    if submitted:
+        if not (candidate_email and hiring_manager_email):
+            st.error("Candidate and hiring manager emails are required.")
+        else:
             try:
-                ics_text = build_ics_event(
-                    slot=chosen_slot,
-                    hm_name=hm_name,
-                    hm_email=hm_email,
-                    hm_tz=hm_tz,
-                    recruiter_name=recruiter_name,
-                    recruiter_email=recruiter_email,
-                    candidate_name=cand_name,
-                    candidate_email=cand_email,
-                    company=company,
-                    role=role_title,
-                    interview_type=interview_type,
-                    location_or_instructions=location_text,
+                start_local, end_local, start_utc, end_utc = normalize_datetime(
+                    meeting_date, meeting_time, tz_choice, int(duration_minutes)
                 )
-
-                to_emails = [cand_email, hm_email, recruiter_email]
-                send_email_with_ics(
-                    to_emails=to_emails,
-                    subject=invite_subject,
+                payload = build_graph_event_payload(
+                    subject=subject,
                     body=invite_body,
-                    ics_text=ics_text,
+                    start_local=start_local,
+                    end_local=end_local,
+                    tz_name=tz_choice,
+                    candidate_email=candidate_email,
+                    hiring_manager_email=hiring_manager_email,
+                    recruiter_email=recruiter_email_field,
+                    include_recruiter=include_recruiter,
+                    interview_type=interview_type,
+                    location_text=location_text,
+                    organizer_name=recruiter_name,
+                    candidate_name=candidate_name,
+                    hiring_manager_name=hiring_manager_name,
                 )
+                result = graph_client.create_event(payload)
+                event_id = result.get("id")
+                st.session_state["latest_event_id"] = event_id
+                audit_logger.log(
+                    action="graph_create_event",
+                    status="success",
+                    actor=GRAPH_SCHEDULER,
+                    candidate_email=candidate_email,
+                    hiring_manager_email=hiring_manager_email,
+                    recruiter_email=recruiter_email_field,
+                    role_title=role_title,
+                    event_id=event_id,
+                    payload=redact_payload(payload, {"client_secret"}),
+                )
+                audit_logger.save_event(
+                    event_id=event_id,
+                    candidate_email=candidate_email,
+                    hiring_manager_email=hiring_manager_email,
+                    recruiter_email=recruiter_email_field,
+                    role_title=role_title,
+                    subject=subject,
+                    start_utc=start_utc.isoformat(),
+                    end_utc=end_utc.isoformat(),
+                    timezone=tz_choice,
+                    status="created",
+                )
+                ics_text = build_ics_payload(
+                    start_dt_utc=start_utc,
+                    end_dt_utc=end_utc,
+                    subject=subject,
+                    description=invite_body.replace("<br>", "\n"),
+                    organizer_name=recruiter_name or "Scheduler",
+                    organizer_email=SMTP_FROM or recruiter_email_field or GRAPH_SCHEDULER,
+                    attendees=[
+                        (candidate_name or "Candidate", candidate_email),
+                        (hiring_manager_name or "Hiring manager", hiring_manager_email),
+                    ],
+                    location=location_text,
+                    uid=event_id or str(uuid.uuid4()),
+                )
+                st.session_state["latest_ics"] = ics_text
+                st.success(f"Graph event created and invites sent. Event ID: {event_id}")
+            except GraphClientError as e:
+                st.error(f"Graph create failed: {e} ({e.details})")
+                audit_logger.log(
+                    action="graph_create_failed",
+                    status="failed",
+                    actor=GRAPH_SCHEDULER,
+                    candidate_email=candidate_email,
+                    hiring_manager_email=hiring_manager_email,
+                    recruiter_email=recruiter_email_field,
+                    role_title=role_title,
+                    payload={"status": e.status},
+                    error_message=str(e),
+                )
+                ics_text = build_ics_payload(
+                    start_dt_utc=start_utc,
+                    end_dt_utc=end_utc,
+                    subject=subject,
+                    description=invite_body.replace("<br>", "\n"),
+                    organizer_name=recruiter_name or "Scheduler",
+                    organizer_email=SMTP_FROM or recruiter_email_field or GRAPH_SCHEDULER,
+                    attendees=[
+                        (candidate_name or "Candidate", candidate_email),
+                        (hiring_manager_name or "Hiring manager", hiring_manager_email),
+                    ],
+                    location=location_text,
+                    uid=str(uuid.uuid4()),
+                )
+                st.session_state["latest_ics"] = ics_text
+                st.download_button(
+                    "Download .ics fallback",
+                    data=ics_text,
+                    file_name="interview_invite.ics",
+                    mime="text/calendar",
+                    on_click=lambda: audit_logger.log(
+                        action="ics_downloaded",
+                        status="success",
+                        actor=SMTP_FROM,
+                        candidate_email=candidate_email,
+                        hiring_manager_email=hiring_manager_email,
+                        recruiter_email=recruiter_email_field,
+                        role_title=role_title,
+                    ),
+                )
+            except Exception as e:  # pragma: no cover - UI safety
+                st.error(f"Unexpected error: {e}")
 
-                st.success(
-                    "Calendar invite sent to candidate, hiring manager, and recruiter "
-                    "from the scheduling mailbox. 🎉"
-                )
-            except Exception as e:
-                st.error(f"Error sending calendar invite: {e}")
+    st.markdown("---")
+    st.markdown("### Reschedule existing event")
+    stored_events = audit_logger.scheduled_events()
+    event_options = [f"{ev['subject']} ({ev['event_id']})" for ev in stored_events]
+    chosen_event_id: Optional[str] = None
+    if event_options:
+        selected_label = st.selectbox("Select event to reschedule", options=["-- select --"] + event_options)
+        if selected_label != "-- select --":
+            chosen_event_id = stored_events[event_options.index(selected_label)]["event_id"]
+    manual_event_id = st.text_input("Or enter event ID", value=st.session_state.get("latest_event_id") or "")
+    event_to_use = chosen_event_id or manual_event_id
+
+    col_rs1, col_rs2 = st.columns(2)
+    with col_rs1:
+        new_date = st.date_input("New date", value=date.today())
+        new_time = st.time_input("New start time", value=time(hour=11))
+    with col_rs2:
+        new_duration = st.number_input("New duration (minutes)", min_value=15, max_value=240, value=60, step=15)
+        new_tz = st.selectbox("Timezone", options=tz_options, index=tz_default_index)
+
+    if st.button("Reschedule via Graph", disabled=not (graph_ready and event_to_use)):
+        try:
+            start_local, end_local, start_utc, end_utc = normalize_datetime(new_date, new_time, new_tz, int(new_duration))
+            patch_payload = {
+                "start": {"dateTime": start_local.isoformat(), "timeZone": new_tz},
+                "end": {"dateTime": end_local.isoformat(), "timeZone": new_tz},
+            }
+            graph_client.update_event(event_to_use, patch_payload)
+            audit_logger.log(
+                action="graph_reschedule_event",
+                status="success",
+                actor=GRAPH_SCHEDULER,
+                event_id=event_to_use,
+                payload=patch_payload,
+            )
+            audit_logger.save_event(
+                event_id=event_to_use,
+                candidate_email="",
+                hiring_manager_email="",
+                recruiter_email="",
+                role_title=role_title,
+                subject=subject,
+                start_utc=start_utc.isoformat(),
+                end_utc=end_utc.isoformat(),
+                timezone=new_tz,
+                status="rescheduled",
+            )
+            st.success("Event rescheduled. Teams link preserved.")
+        except GraphClientError as e:
+            st.error(f"Reschedule failed: {e} ({e.details})")
+            audit_logger.log(
+                action="graph_reschedule_failed",
+                status="failed",
+                actor=GRAPH_SCHEDULER,
+                event_id=event_to_use,
+                payload={"status": e.status},
+                error_message=str(e),
+            )
+
+    st.markdown("---")
+    st.markdown("### Cancel interview")
+    cancel_event_id = st.text_input("Event ID to cancel", value=event_to_use)
+    if st.button("Cancel via Graph", disabled=not (graph_ready and cancel_event_id)):
+        try:
+            graph_client.delete_event(cancel_event_id)
+            audit_logger.log(
+                action="graph_cancel_event",
+                status="success",
+                actor=GRAPH_SCHEDULER,
+                event_id=cancel_event_id,
+            )
+            audit_logger.remove_event(cancel_event_id)
+            st.success("Event cancelled and attendees notified.")
+        except GraphClientError as e:
+            st.error(f"Cancel failed: {e} ({e.details})")
+            audit_logger.log(
+                action="graph_cancel_failed",
+                status="failed",
+                actor=GRAPH_SCHEDULER,
+                event_id=cancel_event_id,
+                payload={"status": e.status},
+                error_message=str(e),
+            )
+
+    st.markdown("---")
+    st.markdown("### ICS fallback / email")
+
+    ics_text = st.session_state.get("latest_ics")
+    if ics_text:
+        st.download_button(
+            "Download last generated .ics",
+            data=ics_text,
+            file_name="interview_invite.ics",
+            mime="text/calendar",
+            on_click=lambda: audit_logger.log(
+                action="ics_downloaded",
+                status="success",
+                actor=SMTP_FROM,
+                event_id=st.session_state.get("latest_event_id"),
+            ),
+        )
+        if SMTP_USER and SMTP_PASSWORD:
+            to_emails = [candidate_email, hiring_manager_email]
+            cc_emails = [recruiter_email_field] if recruiter_email_field else None
+            if st.button("Email ICS to attendees"):
+                try:
+                    send_email_with_ics(to_emails, subject, invite_body.replace("<br>", "\n"), ics_text, cc_emails)
+                    audit_logger.log(
+                        action="smtp_sent_ics",
+                        status="success",
+                        actor=SMTP_FROM,
+                        event_id=st.session_state.get("latest_event_id"),
+                    )
+                    st.success("ICS emailed to attendees.")
+                except Exception as e:
+                    audit_logger.log(
+                        action="smtp_send_failed",
+                        status="failed",
+                        actor=SMTP_FROM,
+                        event_id=st.session_state.get("latest_event_id"),
+                        error_message=str(e),
+                    )
+                    st.error(f"Failed to send ICS via SMTP: {e}")
+    else:
+        st.info("No ICS generated yet. Submit a scheduling request or retry after a Graph failure.")
+
+    st.markdown("---")
+    st.markdown("### Audit log")
+    entries = audit_logger.recent_audit_entries(limit=100)
+    if entries:
+        st.dataframe(entries, use_container_width=True, hide_index=True)
+    else:
+        st.info("No audit entries yet.")
